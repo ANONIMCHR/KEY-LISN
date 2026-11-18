@@ -1,13 +1,14 @@
 --[[
-    NX OFFICIAL CHEAT ENGINE V1.5.1
+    NX OFFICIAL CHEAT ENGINE V1.5.2
     Dev  : Chris Official
     Team : NX OFFICIAL STUDIO
-    Changelog V1.5.1:
-      FIX: Crash/disconnect — removed GetDescendants from scan loop (cached targets)
-      FIX: Brutal fire — throttled coroutine, HRP+camera snap, tool:Activate, no remote flood
-      FIX: Aim lock — BindToRenderStep after CameraModule + Scriptable camera type
-      FIX: ESP throttled to 30Hz
-      KEPT: V1.5 dropdown/toggle/fly/noclip fixes
+    Changelog V1.5.2:
+      FIX: Aim lock — re-evaluates closest target every 100ms, short stickiness
+      FIX: Aim lock — skips dead / respawning players, drops target instantly on death
+      FIX: ESP — auto-clears drawings on Humanoid.Died / CharacterRemoving / PlayerRemoving
+      FIX: Brutal — re-validates target each tick, re-acquires if target dies
+      FIX: ESP skeleton — dedicated bone thickness (default 3, slider 1-8)
+      KEPT: V1.5.1 crash fixes, throttled coroutines, Scriptable camera handling
 ]]--
 
 local Players          = game:GetService("Players")
@@ -23,7 +24,7 @@ local LP = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
 local CONFIG = {
-    VERSION = "V1.5.1",
+    VERSION = "V1.5.2",
     DEV     = "Chris Official",
     TEAM    = "NX OFFICIAL STUDIO",
     KEY_URL = "https://raw.githubusercontent.com/ANONIMCHR/KEY-LISN/refs/heads/main/loginkey.JSON",
@@ -46,7 +47,7 @@ local function httpGet(url)
 end
 
 local function loadLogo()
-    local fname = "nx_logo_v151.png"
+    local fname = "nx_logo_v152.png"
     if not (isfile and isfile(fname)) then
         local bin = httpGet(CONFIG.LOGO_URL)
         if bin and #bin > 100 and writefile then pcall(writefile, fname, bin) end
@@ -181,7 +182,7 @@ local EventSys = {
     autoClaim = false, autoTeleport = false, autoPrompt = false,
     claimRadius = 400, pollRate = 0.5,
     knownPrompts = {}, knownClicks = {},
-    targetCache = {},          -- [BasePart] = true, built ON toggle
+    targetCache = {},
     targetCacheBuilt = false,
     lastScan = 0,
 }
@@ -213,7 +214,6 @@ local function triggerClick(cd)
     if hasFCD then pcall(fireclickdetector, cd) end
 end
 
--- Build target cache ONCE when auto-teleport toggled. Chunked yield to avoid freeze.
 local function buildTeleportCache()
     EventSys.targetCache = {}
     EventSys.targetCacheBuilt = false
@@ -244,7 +244,6 @@ Workspace.DescendantAdded:Connect(function(inst)
     end
 end)
 
--- Light scan — iterates cached maps only, no GetDescendants
 local function lightScan()
     if not EventSys.autoClaim and not EventSys.autoTeleport and not EventSys.autoPrompt then return end
     local now = os.clock()
@@ -287,7 +286,6 @@ local function lightScan()
     end
 end
 
--- Initial prompt/click index — chunked
 task.spawn(function()
     local i = 0
     for _, inst in ipairs(Workspace:GetDescendants()) do
@@ -460,9 +458,16 @@ local function buildMain(entry, expiry)
     sideBtn("AIM"); sideBtn("EVENT"); sideBtn("MISC"); sideBtn("STATUS")
 
     -- ======================================================
-    -- ESP
+    -- ESP (V1.5.2)
     -- ======================================================
-    local ESP = {enabled=false, bones=false, box=false, names=false, lines=false, health=false, thickness=2, hue=0, drawings={}}
+    local ESP = {
+        enabled=false, bones=false, box=false, names=false,
+        lines=false, health=false,
+        thickness=2,
+        boneThickness=3,
+        hue=0, drawings={},
+    }
+
     local R15_BONES = {{"Head","UpperTorso"},{"UpperTorso","LowerTorso"},{"UpperTorso","LeftUpperArm"},{"LeftUpperArm","LeftLowerArm"},{"LeftLowerArm","LeftHand"},{"UpperTorso","RightUpperArm"},{"RightUpperArm","RightLowerArm"},{"RightLowerArm","RightHand"},{"LowerTorso","LeftUpperLeg"},{"LeftUpperLeg","LeftLowerLeg"},{"LeftLowerLeg","LeftFoot"},{"LowerTorso","RightUpperLeg"},{"RightUpperLeg","RightLowerLeg"},{"RightLowerLeg","RightFoot"}}
     local R6_BONES = {{"Head","Torso"},{"Torso","Left Arm"},{"Torso","Right Arm"},{"Torso","Left Leg"},{"Torso","Right Leg"}}
     local function bonesFor(ch) if ch:FindFirstChild("UpperTorso") then return R15_BONES end if ch:FindFirstChild("Torso") then return R6_BONES end return R15_BONES end
@@ -471,12 +476,56 @@ local function buildMain(entry, expiry)
     local function clearESP(plr) if ESP.drawings[plr] then for _,d in ipairs(ESP.drawings[plr]) do pcall(function() d:Remove() end) end ESP.drawings[plr]=nil end end
     local function clearAll() for p in pairs(ESP.drawings) do clearESP(p) end end
 
+    local deathHooks = {}
+    local function hookDeath(plr)
+        local ch = plr.Character
+        if not ch then return end
+        if deathHooks[plr] then
+            for _,c in ipairs(deathHooks[plr]) do pcall(function() c:Disconnect() end) end
+            deathHooks[plr] = nil
+        end
+        local conns = {}
+        local hum = ch:FindFirstChildOfClass("Humanoid")
+        if hum then
+            table.insert(conns, hum.Died:Connect(function() clearESP(plr) end))
+        end
+        table.insert(conns, ch.AncestryChanged:Connect(function(_, parent)
+            if not parent then clearESP(plr) end
+        end))
+        deathHooks[plr] = conns
+    end
+
+    Players.PlayerAdded:Connect(function(plr)
+        plr.CharacterAdded:Connect(function() task.wait(0.2); hookDeath(plr) end)
+    end)
+    Players.PlayerRemoving:Connect(function(plr)
+        clearESP(plr)
+        if deathHooks[plr] then
+            for _,c in ipairs(deathHooks[plr]) do pcall(function() c:Disconnect() end) end
+            deathHooks[plr] = nil
+        end
+    end)
+    for _,plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then
+            if plr.Character then hookDeath(plr) end
+            plr.CharacterAdded:Connect(function() task.wait(0.2); hookDeath(plr) end)
+        end
+    end
+
     local function setupESP(plr)
         if plr==LP then return end
         clearESP(plr)
         if not plr.Character then return end
         local d = {}; ESP.drawings[plr] = d; local col = pColor(plr)
-        if ESP.bones then for _=1,14 do local l=Drawing.new("Line"); l.Visible=false; l.Thickness=ESP.thickness; l.Color=col; table.insert(d,l) end end
+        if ESP.bones then
+            for _=1,14 do
+                local l=Drawing.new("Line")
+                l.Visible=false
+                l.Thickness=ESP.boneThickness
+                l.Color=col
+                table.insert(d,l)
+            end
+        end
         if ESP.box then local b=Drawing.new("Square"); b.Visible=false; b.Thickness=ESP.thickness; b.Color=col; b.Filled=false; table.insert(d,b) end
         if ESP.names then local t=Drawing.new("Text"); t.Visible=false; t.Size=15; t.Center=true; t.Outline=true; t.Color=col; t.Font=2; table.insert(d,t) end
         if ESP.health then local hbg=Drawing.new("Square"); hbg.Visible=false; hbg.Filled=true; hbg.Color=Color3.fromRGB(0,0,0); table.insert(d,hbg); local hb=Drawing.new("Square"); hb.Visible=false; hb.Filled=true; table.insert(d,hb) end
@@ -484,7 +533,10 @@ local function buildMain(entry, expiry)
     end
 
     local function updateESP()
-        if not ESP.enabled then for _,dd in pairs(ESP.drawings) do for _,x in ipairs(dd) do x.Visible=false end end return end
+        if not ESP.enabled then
+            for _,dd in pairs(ESP.drawings) do for _,x in ipairs(dd) do x.Visible=false end end
+            return
+        end
         ESP.hue = (ESP.hue+0.003)%1
         for _,plr in ipairs(Players:GetPlayers()) do
             if plr ~= LP then
@@ -502,7 +554,11 @@ local function buildMain(entry, expiry)
                             local line = d[bi]
                             if a and b and line then
                                 local pa,pb = w2s(a.Position), w2s(b.Position)
-                                if pa and pb then line.From=pa; line.To=pb; line.Color=col; line.Thickness=ESP.thickness; line.Visible=true
+                                if pa and pb then
+                                    line.From=pa; line.To=pb
+                                    line.Color=col
+                                    line.Thickness=ESP.boneThickness
+                                    line.Visible=true
                                 else line.Visible=false end
                             elseif line then line.Visible=false end
                         end
@@ -513,23 +569,41 @@ local function buildMain(entry, expiry)
                     if ESP.names then local txt=d[idx]; idx=idx+1; if txt then local head=ch:FindFirstChild("Head"); local p=head and w2s(head.Position+Vector3.new(0,1.2,0)); if p then txt.Text=string.format("%s [%d]",plr.Name,math.floor(hum.Health)); txt.Position=p; txt.Color=col; txt.Visible=true else txt.Visible=false end end end
                     if ESP.health then local hbg=d[idx]; idx=idx+1; local hb=d[idx]; idx=idx+1; if hbg and hb then local head=ch:FindFirstChild("Head"); local hp=w2s(hrp.Position); local hd=head and w2s(head.Position); if hp and hd then local h=math.abs(hp.Y-hd.Y)*2.3; local x=hp.X-h*0.55/2-9; local y=hp.Y-h/2; local pct=math.clamp(hum.Health/math.max(hum.MaxHealth,1),0,1); hbg.Size=Vector2.new(5,h); hbg.Position=Vector2.new(x,y); hbg.Visible=true; hb.Size=Vector2.new(5,h*pct); hb.Position=Vector2.new(x,y+h*(1-pct)); hb.Color=Color3.fromHSV(0.33*pct,1,1); hb.Visible=true else hbg.Visible=false; hb.Visible=false end end end
                     if ESP.lines then local tr=d[idx]; if tr then local head=ch:FindFirstChild("Head"); local p=head and w2s(head.Position); if p then local vp=Camera.ViewportSize; tr.From=Vector2.new(vp.X/2,vp.Y); tr.To=p; tr.Color=col; tr.Thickness=ESP.thickness; tr.Visible=true else tr.Visible=false end end end
-                else clearESP(plr) end
+                else
+                    if ESP.drawings[plr] then
+                        for _,x in ipairs(ESP.drawings[plr]) do x.Visible=false end
+                        clearESP(plr)
+                    end
+                end
             end
         end
     end
 
     -- ======================================================
-    -- AIM (FIXED — RenderStep after Camera + Scriptable)
+    -- AIM (V1.5.2)
     -- ======================================================
     local AIM = {
         lock=false, autokill=false, smooth=true,
         smoothSpeed=0.35, aimPart="Head",
         accuracyPx=250, currentTarget=nil,
         savedCamType=nil,
+        stickyUntil=0,
+        stickyTarget=nil,
+        switchInterval=0.10,
+        lastSwitch=0,
     }
 
     local fovCircle = Drawing.new("Circle")
     fovCircle.Visible=false; fovCircle.Thickness=2; fovCircle.Color=C.ACCENT; fovCircle.Filled=false; fovCircle.NumSides=64
+
+    local function isAlive(plr)
+        local ch = plr and plr.Character
+        if not ch then return false end
+        local hum = ch:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then return false end
+        if not ch:FindFirstChild("HumanoidRootPart") then return false end
+        return true
+    end
 
     local function getAimPart(plr)
         local ch = plr.Character; if not ch then return nil end
@@ -544,16 +618,13 @@ local function buildMain(entry, expiry)
         local vp = Camera.ViewportSize; local center = Vector2.new(vp.X/2, vp.Y/2)
         local best, bestD = nil, maxPx
         for _,plr in ipairs(Players:GetPlayers()) do
-            if plr~=LP then
-                local ch=plr.Character; local hum=ch and ch:FindFirstChildOfClass("Humanoid")
-                if ch and hum and hum.Health>0 then
-                    local part=getAimPart(plr)
-                    if part then
-                        local sp,on=Camera:WorldToViewportPoint(part.Position)
-                        if on and sp.Z>0 then
-                            local d=(Vector2.new(sp.X,sp.Y)-center).Magnitude
-                            if d<bestD then bestD=d; best=plr end
-                        end
+            if plr~=LP and isAlive(plr) then
+                local part=getAimPart(plr)
+                if part then
+                    local sp,on=Camera:WorldToViewportPoint(part.Position)
+                    if on and sp.Z>0 then
+                        local d=(Vector2.new(sp.X,sp.Y)-center).Magnitude
+                        if d<bestD then bestD=d; best=plr end
                     end
                 end
             end
@@ -562,24 +633,52 @@ local function buildMain(entry, expiry)
     end
 
     local function updateTarget()
+        local now = os.clock()
+
         if AIM.currentTarget then
-            local ch=AIM.currentTarget.Character; local hum=ch and ch:FindFirstChildOfClass("Humanoid")
-            if ch and hum and hum.Health>0 then
-                local part=getAimPart(AIM.currentTarget)
+            if not isAlive(AIM.currentTarget) then
+                AIM.currentTarget = nil
+                AIM.stickyTarget = nil
+                AIM.stickyUntil = 0
+            else
+                local part = getAimPart(AIM.currentTarget)
                 if part then
-                    local sp,on=Camera:WorldToViewportPoint(part.Position)
-                    local vp=Camera.ViewportSize; local center=Vector2.new(vp.X/2,vp.Y/2)
-                    local d=(on and sp.Z>0) and (Vector2.new(sp.X,sp.Y)-center).Magnitude or math.huge
-                    if d < AIM.accuracyPx*1.8 then return AIM.currentTarget end
+                    local sp,on = Camera:WorldToViewportPoint(part.Position)
+                    local vp = Camera.ViewportSize
+                    local center = Vector2.new(vp.X/2, vp.Y/2)
+                    local inFov = on and sp.Z>0 and (Vector2.new(sp.X,sp.Y)-center).Magnitude <= AIM.accuracyPx
+                    if not inFov then
+                        AIM.currentTarget = nil
+                        AIM.stickyTarget = nil
+                        AIM.stickyUntil = 0
+                    end
+                else
+                    AIM.currentTarget = nil
                 end
             end
-            AIM.currentTarget=nil
         end
-        AIM.currentTarget=closestTarget(AIM.accuracyPx)
+
+        if AIM.currentTarget and now < AIM.stickyUntil and AIM.stickyTarget == AIM.currentTarget then
+            return AIM.currentTarget
+        end
+
+        if now - AIM.lastSwitch >= AIM.switchInterval or not AIM.currentTarget then
+            AIM.lastSwitch = now
+            local fresh = closestTarget(AIM.accuracyPx)
+            if fresh then
+                AIM.currentTarget = fresh
+                AIM.stickyTarget = fresh
+                AIM.stickyUntil = now + AIM.switchInterval
+            else
+                AIM.currentTarget = nil
+                AIM.stickyTarget = nil
+                AIM.stickyUntil = 0
+            end
+        end
+
         return AIM.currentTarget
     end
 
-    -- Camera type management
     local function updateAimCameraType()
         local wantScriptable = (AIM.lock or AIM.autokill)
         if wantScriptable then
@@ -595,15 +694,13 @@ local function buildMain(entry, expiry)
         end
     end
 
-    -- Bind AFTER CameraModule runs
-    pcall(function()
-        RunService:UnbindFromRenderStep("NX_AimLock")
-    end)
+    pcall(function() RunService:UnbindFromRenderStep("NX_AimLock") end)
     RunService:BindToRenderStep("NX_AimLock", Enum.RenderPriority.Camera.Value + 1, function(dt)
         updateAimCameraType()
         if not (AIM.lock or AIM.autokill) then
             fovCircle.Visible = false
             AIM.currentTarget = nil
+            AIM.stickyTarget = nil
             return
         end
         local vp = Camera.ViewportSize
@@ -626,15 +723,14 @@ local function buildMain(entry, expiry)
     end)
 
     -- ======================================================
-    -- BRUTAL FIRE — separate throttled coroutine
+    -- BRUTAL FIRE (V1.5.2)
     -- ======================================================
     local brutalRunning = false
     local function brutalFireOnce(targetPart)
         local ch = LP.Character
-        if not ch or not targetPart then return end
+        if not ch or not targetPart or not targetPart.Parent then return end
         local tool = ch:FindFirstChildOfClass("Tool")
 
-        -- Rotate HRP toward target (server-side hitbox reads character orientation)
         local hrp = ch:FindFirstChild("HumanoidRootPart")
         if hrp then
             local myPos = hrp.Position
@@ -645,16 +741,12 @@ local function buildMain(entry, expiry)
             end
         end
 
-        -- Snap camera
         pcall(function()
             Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, targetPart.Position)
         end)
 
-        -- Activate tool (this is what fires the real attack remote with correct args)
         if tool then
             pcall(function() tool:Activate() end)
-
-            -- Limited remote fire — only immediate remotes in tool, only targetPart arg
             for _, d in ipairs(tool:GetDescendants()) do
                 if d:IsA("RemoteEvent") then
                     pcall(function() d:FireServer(targetPart) end)
@@ -670,12 +762,18 @@ local function buildMain(entry, expiry)
         brutalRunning = true
         task.spawn(function()
             while brutalRunning and AIM.autokill do
-                local t = AIM.currentTarget or updateTarget()
-                if t then
-                    local part = getAimPart(t)
-                    if part then brutalFireOnce(part) end
+                local t = AIM.currentTarget
+                if not (t and isAlive(t)) then
+                    AIM.currentTarget = nil
+                    AIM.stickyTarget = nil
+                    AIM.stickyUntil = 0
+                    t = updateTarget()
                 end
-                task.wait(0.033) -- ~30Hz, one frame between activate so cam/orientation propagates
+                if t and isAlive(t) then
+                    local part = getAimPart(t)
+                    if part and part.Parent then brutalFireOnce(part) end
+                end
+                task.wait(0.033)
             end
             brutalRunning = false
         end)
@@ -727,14 +825,13 @@ local function buildMain(entry, expiry)
     end
     local function stopNoclip() if Noclip.conn then Noclip.conn:Disconnect(); Noclip.conn=nil end end
 
-    -- Misc state
     local Speed = {enabled=false, value=60}
     local Jump = {enabled=false, value=100}
     local InfJump = {enabled=false}
     local AutoClick = {enabled=false, delay=0.1, last=0}
 
     -- ======================================================
-    -- MAIN LOOP (ESP throttled, scan, misc)
+    -- MAIN LOOP
     -- ======================================================
     local espFrame = 0
     RunService.Heartbeat:Connect(function()
@@ -765,6 +862,7 @@ local function buildMain(entry, expiry)
     makeToggle(espPage, "ESP Health Bar", false, function(s) ESP.health=s; ESP.enabled=s or ESP.bones or ESP.box or ESP.names or ESP.lines; clearAll() end)
     header(espPage, "STYLE")
     makeSlider(espPage, "Line Thickness", 1, 6, 2, function(v) ESP.thickness=v end)
+    makeSlider(espPage, "Skeleton Thickness", 1, 8, 3, function(v) ESP.boneThickness=v end)
 
     header(aimPage, "AIMBOT")
     makeToggle(aimPage, "Aim Lock", false, function(s) AIM.lock=s end)
