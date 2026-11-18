@@ -24,11 +24,11 @@ local LP = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
 local CONFIG = {
-    VERSION = "V1.5.2",
+    VERSION = "V2.0.0",
     DEV     = "Chris Official",
     TEAM    = "NX OFFICIAL STUDIO",
     KEY_URL = "https://raw.githubusercontent.com/ANONIMCHR/KEY-LISN/refs/heads/main/loginkey.JSON",
-    LOGO_URL= "https://files.catbox.moe/nxlogo.png",
+    LOGO_URL= "https://files.catbox.moe/r2mbvd.png",
     TITLE   = "NX CHEAT ENGINE",
     FOOTER  = "NX OFFICIAL CHEAT ENGINE",
 }
