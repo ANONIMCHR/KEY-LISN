@@ -1,13 +1,14 @@
 --[[
-    NX OFFICIAL CHEAT ENGINE V2.0.1
+    NX OFFICIAL CHEAT ENGINE V2.0.2
     Dev  : Chris Official
     Team : NX OFFICIAL STUDIO
-    Changelog V2.0.1:
-      FIX: Aim lock no longer hijacks CameraType — mouse remains movable
-      FIX: Jump hack now validates FloorMaterial before forcing state
-      NEW: Fly to Player (lerp to nearest alive target)
-      NEW: Brutal Damage Spam (fires all remotes at target part)
-      NEW: Auto Respawn
+    Changelog V2.0.2:
+      FIX: Auto Kill no longer kills self (LP filtered from all target loops)
+      FIX: Brutal spam only fires on remote tools, never self
+      FIX: Teleport undetected (velocity-based + jittered scan)
+      FIX: Aim lock remains movable (no CameraType hijack)
+      FIX: Infinite jump validates FloorMaterial
+      KEPT: Fly to player, brutal damage spam, auto respawn, ESP death hooks
 ]]--
 
 local Players          = game:GetService("Players")
@@ -22,7 +23,7 @@ local LP = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
 local CONFIG = {
-    VERSION = "V2.0.1",
+    VERSION = "V2.0.2",
     DEV     = "Chris Official",
     TEAM    = "NX OFFICIAL STUDIO",
     KEY_URL = "https://raw.githubusercontent.com/ANONIMCHR/KEY-LISN/refs/heads/main/loginkey.JSON",
@@ -45,7 +46,7 @@ local function httpGet(url)
 end
 
 local function loadLogo()
-    local fname = "nx_logo_v201.png"
+    local fname = "nx_logo_v202.png"
     if not (isfile and isfile(fname)) then
         local bin = httpGet(CONFIG.LOGO_URL)
         if bin and #bin > 100 and writefile then pcall(writefile, fname, bin) end
@@ -174,13 +175,25 @@ local function validateKey(k)
 end
 
 -- ==========================================================
--- EVENT SYSTEM
+-- EVENT SYSTEM — UNDETECTED TELEPORT
 -- ==========================================================
 local EventSys = {
     autoClaim = false, autoTeleport = false, autoPrompt = false,
-    claimRadius = 400, pollRate = 0.5,
+    claimRadius = 400,
+    pollRate = 0.5,
     knownPrompts = {}, knownClicks = {},
-    targetCache = {}, targetCacheBuilt = false, lastScan = 0,
+    targetCache = {}, targetCacheBuilt = false,
+    lastScan = 0,
+    teleportMode = "velocity",
+    teleportSpeed = 200,
+    lerpSteps = 0.08,
+    teleportCooldown = 1.5,
+    lastTeleport = 0,
+    velocityConn = nil,
+    velocityBody = nil,
+    velocityAtt = nil,
+    teleportTarget = nil,
+    scanJitter = 0,
 }
 
 local CLAIM_KW = {"claim","event","chest","reward","pickup","coin","token","orb","gift","present","supply","drop","box","loot","spin","collect","harvest"}
@@ -204,6 +217,53 @@ local function triggerPrompt(pp)
     end
 end
 local function triggerClick(cd) if hasFCD then pcall(fireclickdetector, cd) end end
+
+local function stopTeleport()
+    if EventSys.velocityConn then EventSys.velocityConn:Disconnect(); EventSys.velocityConn = nil end
+    if EventSys.velocityBody then pcall(function() EventSys.velocityBody:Destroy() end); EventSys.velocityBody = nil end
+    if EventSys.velocityAtt then pcall(function() EventSys.velocityAtt:Destroy() end); EventSys.velocityAtt = nil end
+    EventSys.teleportTarget = nil
+end
+
+local function startTeleportVelocity(targetPos)
+    stopTeleport()
+    local ch = LP.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    EventSys.teleportTarget = targetPos + Vector3.new(0, 3, 0)
+    EventSys.velocityAtt = new("Attachment", {Parent = hrp})
+    EventSys.velocityBody = new("LinearVelocity", {Attachment0 = EventSys.velocityAtt, MaxForce = math.huge, Velocity = Vector3.zero, Parent = hrp})
+    EventSys.velocityConn = RunService.Heartbeat:Connect(function()
+        local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        if not root or not EventSys.teleportTarget or not EventSys.velocityBody then stopTeleport(); return end
+        local dist = EventSys.teleportTarget - root.Position
+        if dist.Magnitude < 4 then stopTeleport(); return end
+        local speed = math.min(EventSys.teleportSpeed, 240)
+        EventSys.velocityBody.Velocity = dist.Unit * speed
+        local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            local st = hum:GetState()
+            if st ~= Enum.HumanoidStateType.Freefall and st ~= Enum.HumanoidStateType.Jumping then
+                pcall(function() hum:ChangeState(Enum.HumanoidStateType.Freefall) end)
+            end
+        end
+    end)
+end
+
+local function startTeleportLerp(targetPos)
+    stopTeleport()
+    local ch = LP.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local goal = CFrame.new(targetPos + Vector3.new(0, 3, 0))
+    EventSys.teleportTarget = goal.Position
+    EventSys.velocityConn = RunService.RenderStepped:Connect(function()
+        local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        if not root then stopTeleport(); return end
+        if (root.Position - goal.Position).Magnitude < 4 then stopTeleport(); return end
+        root.CFrame = root.CFrame:Lerp(goal, math.clamp(EventSys.lerpSteps, 0.02, 0.3))
+    end)
+end
 
 local function buildTeleportCache()
     EventSys.targetCache = {}; EventSys.targetCacheBuilt = false
@@ -233,12 +293,16 @@ end)
 local function lightScan()
     if not EventSys.autoClaim and not EventSys.autoTeleport and not EventSys.autoPrompt then return end
     local now = os.clock()
+    if now - EventSys.lastScan < EventSys.scanJitter then return end
     if now - EventSys.lastScan < EventSys.pollRate then return end
     EventSys.lastScan = now
+    EventSys.scanJitter = EventSys.pollRate * (0.3 + math.random() * 1.4)
+
     local char = LP.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
     if not root then return end
     local myPos = root.Position
+
     if EventSys.autoPrompt then
         for pp in pairs(EventSys.knownPrompts) do
             if not pp.Parent then EventSys.knownPrompts[pp] = nil
@@ -250,7 +314,9 @@ local function lightScan()
             end
         end
     end
+
     if EventSys.autoTeleport and EventSys.targetCacheBuilt then
+        if now - EventSys.lastTeleport < EventSys.teleportCooldown then return end
         local closest, closestDist = nil, EventSys.claimRadius
         for part in pairs(EventSys.targetCache) do
             if not part.Parent then EventSys.targetCache[part] = nil
@@ -259,7 +325,11 @@ local function lightScan()
                 if d < closestDist and d > 4 then closest, closestDist = part, d end
             end
         end
-        if closest then pcall(function() root.CFrame = CFrame.new(closest.Position + Vector3.new(0,3,0)) end) end
+        if closest then
+            EventSys.lastTeleport = now
+            if EventSys.teleportMode == "velocity" then startTeleportVelocity(closest.Position)
+            else startTeleportLerp(closest.Position) end
+        end
     end
 end
 
@@ -509,7 +579,7 @@ local function buildMain(entry, expiry)
     end
 
     -- ======================================================
-    -- AIM — FIXED: no CameraType hijack
+    -- AIM (fixed self-kill, movable lock)
     -- ======================================================
     local AIM = {
         lock=false, autokill=false, smooth=true,
@@ -524,7 +594,8 @@ local function buildMain(entry, expiry)
     fovCircle.Visible=false; fovCircle.Thickness=2; fovCircle.Color=C.ACCENT; fovCircle.Filled=false; fovCircle.NumSides=64
 
     local function isAlive(plr)
-        local ch = plr and plr.Character
+        if not plr or plr == LP then return false end  -- never target self
+        local ch = plr.Character
         if not ch then return false end
         local hum = ch:FindFirstChildOfClass("Humanoid")
         if not hum or hum.Health <= 0 then return false end
@@ -532,6 +603,7 @@ local function buildMain(entry, expiry)
     end
 
     local function getAimPart(plr)
+        if not plr or plr == LP then return nil end  -- never return self
         local ch = plr.Character; if not ch then return nil end
         local name = AIM.aimPart
         if name=="Random" then name = math.random()>0.5 and "Head" or (ch:FindFirstChild("UpperTorso") and "UpperTorso" or "Torso") end
@@ -544,9 +616,9 @@ local function buildMain(entry, expiry)
         local vp = Camera.ViewportSize; local center = Vector2.new(vp.X/2, vp.Y/2)
         local best, bestD = nil, maxPx
         for _,plr in ipairs(Players:GetPlayers()) do
-            if plr~=LP and isAlive(plr) then
+            if plr ~= LP and isAlive(plr) then
                 local part=getAimPart(plr)
-                if part then
+                if part and part.Parent then
                     local sp,on=Camera:WorldToViewportPoint(part.Position)
                     if on and sp.Z>0 then
                         local d=(Vector2.new(sp.X,sp.Y)-center).Magnitude
@@ -582,7 +654,6 @@ local function buildMain(entry, expiry)
         return AIM.currentTarget
     end
 
-    -- KEY CHANGE: no CameraType change. lerp Camera.CFrame only when lock is active.
     pcall(function() RunService:UnbindFromRenderStep("NX_AimLock") end)
     RunService:BindToRenderStep("NX_AimLock", Enum.RenderPriority.Camera.Value + 1, function(dt)
         if not (AIM.lock or AIM.autokill) then
@@ -595,7 +666,6 @@ local function buildMain(entry, expiry)
         fovCircle.Position = Vector2.new(vp.X/2, vp.Y/2)
         fovCircle.Radius = AIM.accuracyPx
 
-        -- fly to player
         if AIM.flyToPlayer then
             local closest, closestDist = nil, math.huge
             local myRoot = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
@@ -617,11 +687,10 @@ local function buildMain(entry, expiry)
         end
 
         local t = updateTarget()
-        if not t then return end
+        if not t or t == LP then return end
         local part = getAimPart(t)
-        if not part then return end
+        if not part or not part.Parent then return end
 
-        -- only modify camera after input; preserves mouse movement
         local camPos = Camera.CFrame.Position
         local newCF = CFrame.lookAt(camPos, part.Position)
         if AIM.smooth and not AIM.autokill then
@@ -632,12 +701,15 @@ local function buildMain(entry, expiry)
     end)
 
     -- ======================================================
-    -- BRUTAL FIRE + DAMAGE SPAM
+    -- BRUTAL FIRE + DAMAGE SPAM (self-safe)
     -- ======================================================
     local brutalRunning = false
+
     local function brutalFireOnce(targetPart)
         local ch = LP.Character
         if not ch or not targetPart or not targetPart.Parent then return end
+        -- safety: never target our own body parts
+        if targetPart:IsDescendantOf(ch) then return end
         local tool = ch:FindFirstChildOfClass("Tool")
         local hrp = ch:FindFirstChild("HumanoidRootPart")
         if hrp then
@@ -656,7 +728,9 @@ local function buildMain(entry, expiry)
     end
 
     local function brutalSpamOnce(targetPart)
-        local ch = LP.Character; if not ch or not targetPart then return end
+        local ch = LP.Character
+        if not ch or not targetPart or not targetPart.Parent then return end
+        if targetPart:IsDescendantOf(ch) then return end
         local containers = {ch, LP:FindFirstChild("Backpack")}
         for _, cont in ipairs(containers) do
             if cont then
@@ -674,13 +748,14 @@ local function buildMain(entry, expiry)
         task.spawn(function()
             while brutalRunning and (AIM.autokill or AIM.brutalSpam) do
                 local t = AIM.currentTarget
+                if t == LP then t = nil end
                 if not (t and isAlive(t)) then
                     AIM.currentTarget=nil; AIM.stickyTarget=nil; AIM.stickyUntil=0
                     t = updateTarget()
                 end
-                if t and isAlive(t) then
+                if t and t ~= LP and isAlive(t) then
                     local part = getAimPart(t)
-                    if part and part.Parent then
+                    if part and part.Parent and not part:IsDescendantOf(LP.Character) then
                         if AIM.autokill then brutalFireOnce(part) end
                         if AIM.brutalSpam then brutalSpamOnce(part) end
                     end
@@ -693,7 +768,7 @@ local function buildMain(entry, expiry)
     local function stopBrutal() brutalRunning = false end
 
     -- ======================================================
-    -- MOVEMENT (fixed jump)
+    -- MOVEMENT
     -- ======================================================
     local Fly = {enabled=false, speed=80, conn=nil, vel=nil, att=nil}
     local function stopFly()
@@ -748,9 +823,7 @@ local function buildMain(entry, expiry)
             if not AutoRespawn.enabled then return end
             local ch = LP.Character
             local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-            if hum and hum.Health <= 0 then
-                pcall(function() LP:LoadCharacter() end)
-            end
+            if hum and hum.Health <= 0 then pcall(function() LP:LoadCharacter() end) end
         end)
     end
     local function stopAutoRespawn()
@@ -758,7 +831,7 @@ local function buildMain(entry, expiry)
     end
 
     -- ======================================================
-    -- MAIN LOOP — fixed jump check
+    -- MAIN LOOP
     -- ======================================================
     local espFrame = 0
     RunService.Heartbeat:Connect(function()
@@ -772,7 +845,6 @@ local function buildMain(entry, expiry)
         if Speed.enabled and hum and hum.WalkSpeed~=Speed.value then hum.WalkSpeed=Speed.value end
         if Jump.enabled and hum and hum.JumpPower~=Jump.value then hum.JumpPower=Jump.value end
 
-        -- FIXED: only force jump if on ground
         if InfJump.enabled and hum then
             if UserInputService:IsKeyDown(Enum.KeyCode.Space) and hum.FloorMaterial ~= Enum.Material.Air then
                 hum:ChangeState(Enum.HumanoidStateType.Jumping)
@@ -812,8 +884,8 @@ local function buildMain(entry, expiry)
 
     header(aimPage, "AIMBOT")
     makeToggle(aimPage, "Aim Lock (movable)", false, function(s) AIM.lock=s end)
-    makeToggle(aimPage, "Auto Kill (BRUTAL)", false, function(s) AIM.autokill=s; if s then startBrutal() else stopBrutal() end end)
-    makeToggle(aimPage, "Brutal Damage Spam", false, function(s) AIM.brutalSpam=s; if s then startBrutal() else stopBrutal() end end)
+    makeToggle(aimPage, "Auto Kill (BRUTAL)", false, function(s) AIM.autokill=s; if s then startBrutal() else if not AIM.brutalSpam then stopBrutal() end end end)
+    makeToggle(aimPage, "Brutal Damage Spam", false, function(s) AIM.brutalSpam=s; if s then startBrutal() else if not AIM.autokill then stopBrutal() end end end)
     makeToggle(aimPage, "Smooth Aim", true, function(s) AIM.smooth=s end)
     makeDropdown(aimPage, "Aim Part", {"Head", "UpperTorso", "Random"}, "Head", function(v) AIM.aimPart=v end)
     makeSlider(aimPage, "Accuracy Radius (px)", 50, 800, 250, function(v) AIM.accuracyPx=v end)
@@ -828,6 +900,11 @@ local function buildMain(entry, expiry)
     makeToggle(eventPage, "Auto Teleport (Name Match)", false, function(s) EventSys.autoTeleport = s; if s and not EventSys.targetCacheBuilt then buildTeleportCache() end end)
     makeSlider(eventPage, "Radius", 50, 2000, 400, function(v) EventSys.claimRadius=v end)
     makeSlider(eventPage, "Scan Interval (ms)", 200, 3000, 500, function(v) EventSys.pollRate=v/1000 end)
+    header(eventPage, "TELEPORT MODE")
+    makeDropdown(eventPage, "Teleport Mode", {"velocity", "lerp"}, "velocity", function(v) EventSys.teleportMode=v end)
+    makeSlider(eventPage, "Teleport Speed", 50, 240, 200, function(v) EventSys.teleportSpeed=v end)
+    makeSlider(eventPage, "Teleport Cooldown (ms)", 500, 5000, 1500, function(v) EventSys.teleportCooldown=v/1000 end)
+    makeSlider(eventPage, "Lerp Steps (%)", 2, 30, 8, function(v) EventSys.lerpSteps=v/100 end)
 
     header(miscPage, "MOVEMENT")
     makeToggle(miscPage, "Speed Hack", false, function(s) Speed.enabled=s end)
